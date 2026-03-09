@@ -88,7 +88,14 @@ const SearchBarContent: React.FC = () => {
 
   const handleResultClick = useCallback(
     (result: SearchResult) => {
-      history.push('/' + result.id);
+      const rawPath = result.metadata?.permalink || result.metadata?.path;
+      const target =
+        typeof rawPath === 'string' && rawPath.trim()
+          ? rawPath.startsWith('/')
+            ? rawPath
+            : `/${rawPath}`
+          : `/${String(result.id).replace(/^\/+/, '')}`;
+      history.push(target);
       setIsModalOpen(false);
       clearSearch();
     },

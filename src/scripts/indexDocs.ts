@@ -18,6 +18,7 @@ import path from 'path';
 interface SearchMetadata {
   title: string;
   path: string;
+  permalink?: string;
   level: number;
   type: string;
   content: string;
@@ -137,15 +138,15 @@ async function findMarkdownFiles(dir: string): Promise<string[]> {
  * Processes a single markdown file and returns its content and metadata
  * @param filePath Path to the markdown file
  */
-async function processMarkdownFile(filePath: string) {
+async function processMarkdownFile(filePath: string, permalinkBySource: Map<string, string>) {
   const content = await fs.readFile(filePath, 'utf-8');
-  const dirPath = path.dirname(path.relative(process.cwd(), filePath))
-    .replace(docsPath, 'docs');
 
-  // Try to get ID from frontmatter, fallback to filename
-  const id = extractId(content) || path.basename(filePath).replace(/\.(md|mdx)$/, '');
-  const relativePath = path.join(dirPath, id);
-
+  const permalink = permalinkBySource.get(path.resolve(filePath));
+  if (!permalink) {
+    throw new Error(
+      `Missing permalink mapping for ${filePath}. Run docusaurus build first.`,
+    );
+  }
   const fileName = path.basename(filePath);
   const title = extractTitle(content, fileName);
 
@@ -153,7 +154,8 @@ async function processMarkdownFile(filePath: string) {
     content,
     title,
     _meta: {
-      path: relativePath,
+      path: permalink,
+      permalink,
     },
   };
 }
@@ -257,6 +259,49 @@ function splitContentIntoChunks(
   return chunks;
 }
 
+const DOCS_METADATA_DIR = path.join(
+  process.cwd(),
+  '.docusaurus',
+  'docusaurus-plugin-content-docs',
+);
+
+function normalizePermalink(permalink: string): string {
+  const p = String(permalink).trim();
+  if (!p || p === '/') return '/';
+  return `/${p.replace(/^\/+|\/+$/g, '')}`;
+}
+
+async function findFilesRecursively(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, {withFileTypes: true});
+  const out: string[] = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await findFilesRecursively(full)));
+    else out.push(full);
+  }
+  return out;
+}
+
+async function loadPermalinkMap(): Promise<Map<string, string>> {
+  const files = (await findFilesRecursively(DOCS_METADATA_DIR)).filter((f) =>
+    /site-docs-.*\.json$/.test(path.basename(f)),
+  );
+
+  const map = new Map<string, string>();
+  for (const f of files) {
+    const j = JSON.parse(await fs.readFile(f, 'utf8'));
+    const source = j?.source; // "@site/docs/1-test.md"
+    const permalink = j?.permalink; // "/test"
+    if (typeof source !== 'string' || typeof permalink !== 'string') continue;
+    if (!source.startsWith('@site/')) continue;
+    const abs = path.resolve(process.cwd(), source.slice('@site/'.length));
+    map.set(abs, normalizePermalink(permalink));
+  }
+  return map;
+}
+
+
 /**
  * Main indexing function
  */
@@ -273,7 +318,10 @@ async function indexDocs() {
     console.log(`Found ${markdownFiles.length} markdown files`);
 
     console.log('Processing markdown files...');
-    const allDocs = await Promise.all(markdownFiles.map(processMarkdownFile));
+    const permalinkBySource = await loadPermalinkMap();
+    const allDocs = await Promise.all(
+      markdownFiles.map((f) => processMarkdownFile(f, permalinkBySource)),
+    );
     console.log(`Processed ${allDocs.length} documents`);
 
     // Reset the index for fresh indexing
@@ -292,12 +340,16 @@ async function indexDocs() {
           const contentChunks = splitContentIntoChunks(section.content);
 
           for (const chunk of contentChunks) {
-            const chunkSuffix = contentChunks.length > 1 ? `-chunk-${chunk.chunkIndex + 1}` : '';
-            const headingId = `${doc._meta.path}#${slugify(section.title!)}${chunkSuffix}`;
+            const baseId = doc._meta.permalink.replace(/^\/+|\/+$/g, ''); // "/test" -> "test"
+            const anchor = section.title ? `#${slugify(section.title)}` : '';
+            const chunkSuffix =
+              contentChunks.length > 1 ? `-chunk-${chunk.chunkIndex + 1}` : '';
+            const headingId = `${baseId}${anchor}${chunkSuffix}`;
 
             const metadata: SearchMetadata = {
               title: section.title ?? '<Error displaying title>',
-              path: doc._meta.path,
+              path: doc._meta.permalink,
+              permalink: doc._meta.permalink,
               level: section.level ?? 2,
               type: contentChunks.length > 1 ? 'section-chunk' : 'section',
               content: chunk.content,
